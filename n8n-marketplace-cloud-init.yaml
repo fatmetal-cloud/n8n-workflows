@@ -1,0 +1,198 @@
+#cloud-config
+timezone: Europe/Moscow
+package_update: true
+package_upgrade: false
+
+packages:
+  - curl
+  - ca-certificates
+  - openssl
+
+write_files:
+  - path: /etc/n8n-mp/params.env
+    permissions: '0600'
+    content: |
+      # Пусто = имя из IP через magic-DNS (fatmetal.net) + авто-TLS.
+      # DOMAIN=ваш.домен - если нужен свой (наведите CNAME на magic-хост).
+      DOMAIN=
+      N8N_VERSION=2.29.10
+      MAGIC_ZONE=fatmetal.net
+      # Каталог n8n-сценариев Fatmetal (для one-click импорта по токену из hostname).
+      CATALOG_API=https://n8n-api.fatmetal.net
+
+  # Единый установщик n8n (встроен в cloud-init, без внешнего источника).
+  - path: /opt/n8n-mp/install.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      # n8n (self-hosted автоматизация) - Fatmetal Marketplace card installer.
+      # docker compose (n8n + postgres:16) + Caddy (авто-TLS). Log: /var/log/n8n-install.log
+      # One-click импорт сценария из каталога: токен берётся из hostname (n8n-<token>).
+      set -x
+      exec > >(tee -a /var/log/n8n-install.log) 2>&1
+      export DEBIAN_FRONTEND=noninteractive
+      echo "[n8n-mp] start $(date -u +%FT%TZ)"
+
+      PARAMS=/etc/n8n-mp/params.env
+      [ -f "$PARAMS" ] && . "$PARAMS" || true
+      N8N_VER="${N8N_VERSION:-2.29.10}"
+      MAGIC_ZONE="${MAGIC_ZONE:-fatmetal.net}"
+      CATALOG_API="${CATALOG_API:-https://n8n-api.fatmetal.net}"
+      APP=/opt/n8n
+      CRED=/root/n8n-credentials.txt
+
+      # 1. public IP -> magic-DNS host (unless vanity DOMAIN set)
+      IP="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+      [ -z "$IP" ] && IP="$(curl -fsS4 --max-time 10 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
+      [ -z "${DOMAIN:-}" ] && DOMAIN="${IP//./-}.${MAGIC_ZONE}"
+      echo "[n8n-mp] IP=$IP DOMAIN=$DOMAIN VER=$N8N_VER"
+
+      # 2. Docker
+      if ! command -v docker >/dev/null 2>&1; then curl -fsSL https://get.docker.com | sh; fi
+      systemctl enable --now docker >/dev/null 2>&1 || true
+      apt-get update -y || true
+      apt-get install -y curl ca-certificates openssl || true
+
+      # 3. secrets + compose + .env
+      mkdir -p "$APP"
+      PG_PW="$(openssl rand -hex 16)"
+      ENC_KEY="$(openssl rand -hex 24)"
+      cat > "$APP/.env" <<ENV
+      DOMAIN=$DOMAIN
+      POSTGRES_PASSWORD=$PG_PW
+      N8N_ENCRYPTION_KEY=$ENC_KEY
+      N8N_VER=$N8N_VER
+      ENV
+      cat > "$APP/compose.yaml" <<'YML'
+      services:
+        postgres:
+          image: postgres:16
+          restart: unless-stopped
+          environment:
+            POSTGRES_USER: n8n
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+            POSTGRES_DB: n8n
+          volumes:
+            - db_storage:/var/lib/postgresql/data
+          healthcheck:
+            test: ['CMD-SHELL', 'pg_isready -U n8n -d n8n']
+            interval: 10s
+            timeout: 5s
+            retries: 10
+        n8n:
+          image: docker.n8n.io/n8nio/n8n:${N8N_VER}
+          restart: unless-stopped
+          ports:
+            - "127.0.0.1:5678:5678"
+          environment:
+            DB_TYPE: postgresdb
+            DB_POSTGRESDB_HOST: postgres
+            DB_POSTGRESDB_PORT: 5432
+            DB_POSTGRESDB_DATABASE: n8n
+            DB_POSTGRESDB_USER: n8n
+            DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+            N8N_HOST: ${DOMAIN}
+            N8N_PORT: 5678
+            N8N_PROTOCOL: https
+            WEBHOOK_URL: https://${DOMAIN}/
+            N8N_EDITOR_BASE_URL: https://${DOMAIN}/
+            N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+            N8N_PROXY_HOPS: 1
+            GENERIC_TIMEZONE: Europe/Moscow
+            N8N_RUNNERS_ENABLED: "true"
+            N8N_SECURE_COOKIE: "true"
+          volumes:
+            - n8n_storage:/home/node/.n8n
+          depends_on:
+            postgres:
+              condition: service_healthy
+      volumes:
+        db_storage:
+        n8n_storage:
+      YML
+
+      cd "$APP"
+      docker compose --env-file "$APP/.env" -f "$APP/compose.yaml" pull -q || true
+      docker compose --env-file "$APP/.env" -f "$APP/compose.yaml" up -d
+
+      # 4. Caddy reverse-proxy на magic-DNS домен (авто-LE)
+      cat > /opt/Caddyfile <<EOF
+      ${DOMAIN} {
+        reverse_proxy 127.0.0.1:5678
+      }
+      EOF
+      for i in 1 2 3 4 5 6; do docker pull caddy:2 && break; echo "[n8n-mp] caddy pull retry $i"; sleep 10; done
+      docker rm -f n8n-caddy >/dev/null 2>&1 || true
+      docker run -d --name n8n-caddy --restart unless-stopped --network host \
+        -v /opt/Caddyfile:/etc/caddy/Caddyfile -v caddy_data:/data caddy:2
+
+      # 5. ждём n8n :5678
+      echo "[n8n-mp] waiting for n8n on :5678"
+      for i in $(seq 1 90); do
+        code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:5678/ 2>/dev/null || echo 000)
+        [ "$code" = "200" ] && { echo "[n8n-mp] up ($code) на $i"; break; }
+        sleep 10
+      done
+
+      # 5b. One-click импорт сценария из каталога Fatmetal.
+      # Токен закодирован в hostname заказа: n8n-<token>. Если его нет
+      # (обычный заказ n8n) - импорт пропускается, ставится чистый n8n.
+      # Токен ищем как n8n-<hex> в hostname устойчиво к хвостам: маркетплейс/DNS
+      # может дописать домен (n8n-<token>.fatmetal.net) - grep вытащит токен и так.
+      HOST="$(hostname -f 2>/dev/null || hostname)"
+      TOKEN="$(echo "$HOST" | grep -oE 'n8n-[a-f0-9]{6,32}' | head -1 | sed 's/^n8n-//')"
+      if [ -n "$TOKEN" ]; then
+        echo "[n8n-mp] scenario token=$TOKEN, resolving..."
+        RESOLVE="$(curl -fsS --max-time 15 "$CATALOG_API/api/deploy/$TOKEN" 2>/dev/null || true)"
+        DL="$(echo "$RESOLVE" | sed -n 's/.*"download_url":"\([^"]*\)".*/\1/p')"
+        if [ -n "$DL" ]; then
+          echo "[n8n-mp] downloading scenario: $DL"
+          if curl -fsS --max-time 30 -o /tmp/workflow.json "$DL"; then
+            # копируем в контейнер и импортируем через n8n CLI
+            docker cp /tmp/workflow.json "$(docker compose -f "$APP/compose.yaml" ps -q n8n)":/tmp/workflow.json 2>/dev/null || \
+              docker cp /tmp/workflow.json n8n:/tmp/workflow.json 2>/dev/null || true
+            if docker compose -f "$APP/compose.yaml" exec -T n8n n8n import:workflow --input=/tmp/workflow.json; then
+              echo "[n8n-mp] scenario imported OK"
+              echo "SCENARIO_IMPORTED $TOKEN" >> /var/log/n8n-install.log
+            else
+              echo "[n8n-mp] WARN: import failed (n8n version CLI mismatch?), scenario JSON saved at /root/workflow.json"
+              cp /tmp/workflow.json /root/workflow.json 2>/dev/null || true
+            fi
+          else
+            echo "[n8n-mp] WARN: scenario download failed"
+          fi
+        else
+          echo "[n8n-mp] WARN: token $TOKEN not resolved (expired?), skipping import"
+        fi
+      else
+        echo "[n8n-mp] no scenario token in hostname, clean n8n"
+      fi
+
+      # 6. Креды + MOTD
+      cat > "$CRED" <<CREDS
+      === n8n (Fatmetal Marketplace) ===
+      Адрес:    https://${DOMAIN}/
+      Версия:   ${N8N_VER}
+      Вход:     пароля заранее нет. Откройте адрес и создайте аккаунт ВЛАДЕЛЬЦА (email, пароль, имя).
+                Сделайте это сразу, пока адрес знаете только вы.
+      Интерфейс: английский (у n8n нет русской локализации).
+      Ключ шифрования (БЕРЕЧЬ - им зашифрованы учетки интеграций): ${ENC_KEY}
+      БД пароль: ${PG_PW}
+      CREDS
+      chmod 600 "$CRED"
+      cat > /etc/motd <<EOF
+
+        n8n (автоматизация рабочих процессов) готов.
+        Адрес:   https://${DOMAIN}/
+        Вход:    откройте адрес и создайте аккаунт владельца (email, пароль). Интерфейс английский.
+        Ключ шифрования и БД-пароль - в /root/n8n-credentials.txt (берегите ключ!).
+
+      EOF
+
+      echo "[n8n-mp] containers:"; docker compose -f "$APP/compose.yaml" ps 2>/dev/null | tail -5
+      echo "N8N_INSTALL_DONE $(date -u +%FT%TZ)"
+
+runcmd:
+  - echo "PROCESS" > /var/log/n8n-install-status.log
+  - [ bash, /opt/n8n-mp/install.sh ]
+  - echo "READY" > /var/log/n8n-install-status.log

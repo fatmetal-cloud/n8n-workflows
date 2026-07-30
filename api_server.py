@@ -17,6 +17,8 @@ import re
 import urllib.parse
 from pathlib import Path
 import uvicorn
+import fatmetal_facade  # Fatmetal: русский фасад (надстройка)
+import fatmetal_deploy  # Fatmetal: реестр отложенных деплоев (CTA)
 import time
 from collections import defaultdict
 
@@ -28,6 +30,8 @@ app = FastAPI(
     description="Fast API for browsing and searching workflow documentation",
     version="2.0.0",
 )
+app.include_router(fatmetal_facade.router)  # Fatmetal: эндпоинты фасада
+app.include_router(fatmetal_deploy.router)  # Fatmetal: эндпоинты деплоя
 
 # Security: Rate limiting storage
 rate_limit_storage = defaultdict(list)
@@ -126,7 +130,10 @@ def validate_filename(filename: str) -> bool:
         return False
 
     # Only allow alphanumeric, dash, underscore, and .json extension
-    if not re.match(r"^[a-zA-Z0-9_\-]+\.json$", decoded):
+    # Fatmetal: разрешаем пробелы, скобки, +, точки (в каталоге есть такие имена).
+    # Опасные символы (.. / \\ | < > * ? $ ; & ~ : \\0 переводы строк) уже отсечены
+    # чёрным списком выше, так что расширение whitelist безопасно.
+    if not re.match(r"^[\w\s.\-()+]+\.json$", decoded):
         return False
 
     # Additional check: filename should end with .json
@@ -149,6 +156,13 @@ async def startup_event():
     except Exception as e:
         print(f"❌ Database connection failed: {e}")
         raise
+    try:
+        fatmetal_facade.init_facade_table()
+        print("✅ Facade table ready (workflow_ru)")
+        fatmetal_deploy.init_deploy_table()
+        print("✅ Deploy table ready (pending_deploys)")
+    except Exception as e:
+        print(f"⚠️  Facade table init failed: {e}")
 
 
 # Response models
@@ -165,6 +179,8 @@ class WorkflowSummary(BaseModel):
     tags: List[str] = []
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    ru_title: Optional[str] = None
+    ru_description: Optional[str] = None
 
     class Config:
         # Allow conversion of int to bool for active field
@@ -276,6 +292,7 @@ async def search_workflows(
                     "created_at": workflow.get("created_at"),
                     "updated_at": workflow.get("updated_at"),
                 }
+                clean_workflow = fatmetal_facade.enrich_one(clean_workflow)
                 workflow_summaries.append(WorkflowSummary(**clean_workflow))
             except Exception as e:
                 print(
@@ -360,7 +377,8 @@ async def get_workflow_detail(filename: str, request: Request):
         with open(matching_file, "r", encoding="utf-8") as f:
             raw_json = json.load(f)
 
-        return {"metadata": workflow_meta, "raw_json": raw_json}
+        _meta = fatmetal_facade.enrich_one(dict(workflow_meta))
+        return {"metadata": _meta, "raw_json": raw_json}
     except HTTPException:
         raise
     except Exception as e:
@@ -420,8 +438,14 @@ async def download_workflow(filename: str, request: Request):
             )
             raise HTTPException(status_code=403, detail="Access denied")
 
-        return FileResponse(
-            str(file_path), media_type="application/json", filename=filename
+        # Fatmetal: санируем connections (убираем связи на несуществующие ноды),
+        # иначе n8n >= 2.29 отклоняет импорт. Отдаём JSON, а не сырой файл.
+        with open(file_path, "r", encoding="utf-8") as _f:
+            _wf = json.load(_f)
+        _wf = fatmetal_facade.sanitize_workflow(_wf)
+        return JSONResponse(
+            content=_wf,
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
     except HTTPException:
         raise
