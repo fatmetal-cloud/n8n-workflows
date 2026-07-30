@@ -241,3 +241,123 @@ def sanitize_workflow(wf: dict) -> dict:
         return wf
     except Exception:
         return wf
+
+
+# --- Шаги сценария (ноды) для секции «Как это работает» ---
+# Схема потока апстрима (/diagram) не содержит связей (все битые error-handler),
+# граф не строится. Поэтому отдаём чистый упорядоченный СПИСОК нод с типом -
+# фронт рисует его как «шаги сценария». Служебные ноды (Sticky Note) убираем.
+import os as _os, json as _json
+from pathlib import Path as _Path
+
+_TRIGGER_TYPES = {"scheduleTrigger", "webhook", "manualTrigger", "cron", "trigger",
+                  "emailReadImap", "interval"}
+_SKIP_TYPES = {"stickyNote"}
+
+def _node_kind(t: str) -> str:
+    tl = (t or "").lower()
+    if any(x.lower() in tl for x in _TRIGGER_TYPES) or tl.endswith("trigger"):
+        return "trigger"
+    if "stopanderror" in tl or "errortrigger" in tl:
+        return "error"
+    if any(x in tl for x in ("openai", "agent", "lmchat", "gemini", "anthropic", "chain", "embeddings")):
+        return "ai"
+    return "action"
+
+def get_workflow_steps(raw_json: dict) -> list:
+    nodes = raw_json.get("nodes", []) or []
+    steps = []
+    for n in nodes:
+        t = n.get("type", "") or ""
+        short = t.split(".")[-1] if t else ""
+        if short in _SKIP_TYPES:
+            continue
+        steps.append({
+            "name": n.get("name", ""),
+            "type": short,
+            "kind": _node_kind(short),
+        })
+    # триггеры вперёд, ошибки в конец, остальное по исходному порядку
+    order = {"trigger": 0, "action": 1, "ai": 1, "error": 2}
+    steps.sort(key=lambda s: order.get(s["kind"], 1))
+    return steps
+
+
+@router.get("/api/workflows/{filename}/steps")
+async def workflow_steps(filename: str):
+    """Список нод сценария (шаги) для фронта. Читает JSON, чистит служебное."""
+    import re as _re
+    if not _re.match(r"^[\w\s.\-()+]+\.json$", filename):
+        raise HTTPException(status_code=400, detail="bad filename")
+    try:
+        wf_dir = _Path("workflows").resolve()
+        found = None
+        for sub in wf_dir.iterdir():
+            if sub.is_dir():
+                p = sub / filename
+                if p.exists():
+                    found = p
+                    break
+        if not found:
+            raise HTTPException(status_code=404, detail="not found")
+        with open(found, encoding="utf-8") as f:
+            wf = _json.load(f)
+        return {"steps": get_workflow_steps(wf)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"steps failed: {e}")
+
+
+# --- Граф сценария для визуализации «как в n8n» (canvas) ---
+# Отдаём ноды с позициями (position [x,y]) + тип + kind. Связи фронт выводит
+# из позиций (соседние по x в одном y-ряду): реальное поле connections в
+# коллекции битое (сплошь несуществующие error-handler), граф из него не
+# строится, а позиции есть у 100% нод. Служебные Sticky Note убираем.
+def get_workflow_graph(raw_json: dict) -> dict:
+    nodes = raw_json.get("nodes", []) or []
+    out = []
+    for n in nodes:
+        t = n.get("type", "") or ""
+        short = t.split(".")[-1] if t else ""
+        if short in _SKIP_TYPES:
+            continue
+        pos = n.get("position", [0, 0]) or [0, 0]
+        try:
+            x, y = float(pos[0]), float(pos[1])
+        except Exception:
+            x, y = 0.0, 0.0
+        out.append({
+            "name": n.get("name", ""),
+            "type": short,
+            "kind": _node_kind(short),
+            "x": x,
+            "y": y,
+        })
+    return {"nodes": out, "count": len(out)}
+
+
+@router.get("/api/workflows/{filename}/graph")
+async def workflow_graph(filename: str):
+    """Граф сценария (ноды + позиции + типы) для canvas-визуализации."""
+    import re as _re
+    if not _re.match(r"^[\w\s.\-()+]+\.json$", filename):
+        raise HTTPException(status_code=400, detail="bad filename")
+    try:
+        wf_dir = _Path("workflows").resolve()
+        found = None
+        for sub in wf_dir.iterdir():
+            if sub.is_dir():
+                p = sub / filename
+                if p.exists():
+                    found = p
+                    break
+        if not found:
+            raise HTTPException(status_code=404, detail="not found")
+        with open(found, encoding="utf-8") as f:
+            wf = _json.load(f)
+        return get_workflow_graph(wf)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"graph failed: {e}")
