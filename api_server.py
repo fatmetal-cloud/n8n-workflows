@@ -17,6 +17,7 @@ import re
 import urllib.parse
 from pathlib import Path
 import uvicorn
+import fatmetal_facade  # Fatmetal: русский фасад (надстройка)
 import time
 from collections import defaultdict
 
@@ -28,6 +29,7 @@ app = FastAPI(
     description="Fast API for browsing and searching workflow documentation",
     version="2.0.0",
 )
+app.include_router(fatmetal_facade.router)  # Fatmetal: эндпоинты фасада
 
 # Security: Rate limiting storage
 rate_limit_storage = defaultdict(list)
@@ -149,6 +151,11 @@ async def startup_event():
     except Exception as e:
         print(f"❌ Database connection failed: {e}")
         raise
+    try:
+        fatmetal_facade.init_facade_table()
+        print("✅ Facade table ready (workflow_ru)")
+    except Exception as e:
+        print(f"⚠️  Facade table init failed: {e}")
 
 
 # Response models
@@ -165,6 +172,8 @@ class WorkflowSummary(BaseModel):
     tags: List[str] = []
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    ru_title: Optional[str] = None
+    ru_description: Optional[str] = None
 
     class Config:
         # Allow conversion of int to bool for active field
@@ -276,6 +285,7 @@ async def search_workflows(
                     "created_at": workflow.get("created_at"),
                     "updated_at": workflow.get("updated_at"),
                 }
+                clean_workflow = fatmetal_facade.enrich_one(clean_workflow)
                 workflow_summaries.append(WorkflowSummary(**clean_workflow))
             except Exception as e:
                 print(
@@ -360,7 +370,8 @@ async def get_workflow_detail(filename: str, request: Request):
         with open(matching_file, "r", encoding="utf-8") as f:
             raw_json = json.load(f)
 
-        return {"metadata": workflow_meta, "raw_json": raw_json}
+        _meta = fatmetal_facade.enrich_one(dict(workflow_meta))
+        return {"metadata": _meta, "raw_json": raw_json}
     except HTTPException:
         raise
     except Exception as e:

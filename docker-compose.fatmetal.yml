@@ -17,6 +17,8 @@ services:
     environment:
       - ENVIRONMENT=production
       - LOG_LEVEL=info
+      - FACADE_WRITE_TOKEN=${FACADE_WRITE_TOKEN}
+      - WORKFLOW_DB_PATH=/app/database/workflows.db
     restart: unless-stopped
 
 volumes:
