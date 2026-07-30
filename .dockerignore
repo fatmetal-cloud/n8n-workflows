@@ -121,3 +121,17 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+# === Fatmetal: exclude upstream author's side-projects & unused assets ===
+# Побочные проекты автора апстрима — не относятся к каталогу, раздувают образ и attack surface
+medcards-ai/
+ai-stack/
+context/
+.playwright-mcp/
+
+# Оркестрация, которую мы не используем (деплой через свой docker compose)
+k8s/
+helm/
+.devcontainer/
+# Примечание: static/ и templates/ НЕ исключаем — api_server.py создаёт static/
+# на старте и монтирует её опционально (graceful, см. static_dir.exists()); они
+# лёгкие. Мы отдаём headless JSON, но пусть апстримная морда остаётся как есть.

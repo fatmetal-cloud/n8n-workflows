@@ -1,0 +1,24 @@
+# Fatmetal n8n-catalog — headless JSON-API.
+# Порт биндится ТОЛЬКО на 127.0.0.1 — наружу отдаёт Caddy (TLS на n8n-api.fatmetal.net).
+# Без Traefik (TLS через Caddy по DNS-howto). Без веб-морды апстрима.
+services:
+  api:
+    image: n8n-catalog:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: n8n-catalog-api
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - catalog-db:/app/database
+      - catalog-logs:/app/logs
+      - ./workflows:/app/workflows:ro
+    environment:
+      - ENVIRONMENT=production
+      - LOG_LEVEL=info
+    restart: unless-stopped
+
+volumes:
+  catalog-db:
+  catalog-logs:
