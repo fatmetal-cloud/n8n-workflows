@@ -361,3 +361,133 @@ async def workflow_graph(filename: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"graph failed: {e}")
+
+
+# ── Категории Fatmetal (workflow_cat) + топ приложений ────────────────────────
+# Категория проставляется агентом по рус-описанию (как фасад). Отдельная таблица -
+# reindex её не затрёт. Подмешивается в ответ по filename.
+CATEGORIES = [
+    "AI и контент", "Данные и таблицы", "Коммуникации", "Календарь и встречи",
+    "Документы и файлы", "Разработка", "Маркетинг и продажи", "Прочая автоматизация",
+]
+
+def init_cat_table() -> None:
+    with _conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS workflow_cat (
+                filename     TEXT PRIMARY KEY,
+                category     TEXT,
+                generated_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_cat_category ON workflow_cat(category)")
+
+def get_cat(filename):
+    try:
+        with _conn() as c:
+            row = c.execute("SELECT category FROM workflow_cat WHERE filename = ?", (filename,)).fetchone()
+        return row["category"] if row else None
+    except Exception:
+        return None
+
+def enrich_cat_many(items):
+    filenames = [i.get("filename") for i in items if i.get("filename")]
+    cat_map = {}
+    if filenames:
+        try:
+            ph = ",".join("?" * len(filenames))
+            with _conn() as c:
+                rows = c.execute(f"SELECT filename, category FROM workflow_cat WHERE filename IN ({ph})", filenames).fetchall()
+            cat_map = {r["filename"]: r["category"] for r in rows}
+        except Exception:
+            pass
+    for i in items:
+        i["category"] = cat_map.get(i.get("filename"))
+    return items
+
+
+class CatIn(BaseModel):
+    category: str
+
+
+@router.post("/api/workflows/{filename}/category")
+async def upsert_cat(filename: str, body: CatIn, request: Request):
+    """Записать категорию сценария. Требует X-Facade-Token."""
+    _check_token(request)
+    if body.category not in CATEGORIES:
+        raise HTTPException(status_code=400, detail=f"unknown category; allowed: {CATEGORIES}")
+    try:
+        with _conn() as c:
+            c.execute("""
+                INSERT INTO workflow_cat (filename, category, generated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(filename) DO UPDATE SET category=excluded.category, generated_at=datetime('now')
+            """, (filename, body.category))
+        return {"ok": True, "filename": filename, "category": body.category}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"cat write failed: {e}")
+
+
+@router.get("/api/categories-list")
+async def categories_list():
+    """Список категорий Fatmetal + сколько сценариев в каждой."""
+    try:
+        with _conn() as c:
+            rows = c.execute("SELECT category, COUNT(*) AS n FROM workflow_cat GROUP BY category").fetchall()
+        counts = {r["category"]: r["n"] for r in rows}
+        return {"categories": [{"name": cat, "count": counts.get(cat, 0)} for cat in CATEGORIES]}
+    except Exception:
+        return {"categories": [{"name": cat, "count": 0} for cat in CATEGORIES]}
+
+
+@router.get("/api/cat/pending")
+async def cat_pending(limit: int = 50):
+    """Сценарии без категории (для генератора). С рус-описанием для классификации."""
+    try:
+        with _conn() as c:
+            rows = c.execute("""
+                SELECT w.filename, w.name, w.description, w.integrations, r.ru_title, r.ru_description
+                FROM workflows w
+                LEFT JOIN workflow_cat k ON k.filename = w.filename
+                LEFT JOIN workflow_ru r ON r.filename = w.filename
+                WHERE k.filename IS NULL
+                LIMIT ?
+            """, (limit,)).fetchall()
+        return {"pending": [dict(r) for r in rows], "count": len(rows)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"cat pending failed: {e}")
+
+
+# Топ приложений с РФ-приоритетом. Служебные ноды не считаем.
+_APP_JUNK = {
+    "Webhook","Httprequest","Respondtowebhook","Splitinbatches","Executeworkflow",
+    "Extractfromfile","Converttofile","Markdown","Html","Removeduplicates","Form Trigger",
+    "N8N","Set","Function","Code","Filter","Switch","If","Merge","Aggregate","Itemlists",
+    "Noop","Wait","Datetime","Schedule Trigger","Manual Trigger","Editimage","Sort",
+    "Splitout","Emailsend","Readwritefile","Spreadsheetfile","Limit","Rename","Compression",
+    "Xml","Crypto","Ftp","Ssh","Movebinarydata","Renamekeys","Summarize","Comparedatasets",
+}
+# РФ-приоритет: эти сервисы поднимаем в топе (бонус к частоте).
+_RF_BOOST = {"Telegram": 400, "WhatsApp": 400, "VK": 400}
+
+@router.get("/api/top-apps")
+async def top_apps(limit: int = 10):
+    """Топ приложений каталога (с РФ-приоритетом) для фильтра «Популярное»."""
+    try:
+        from collections import Counter
+        cnt = Counter()
+        with _conn() as c:
+            rows = c.execute("SELECT integrations FROM workflows").fetchall()
+        for r in rows:
+            try:
+                ints = _json.loads(r["integrations"] or "[]")
+            except Exception:
+                ints = []
+            for i in set(ints):
+                if i not in _APP_JUNK:
+                    cnt[i] += 1
+        # РФ-приоритет: добавляем бонус к счётчику для ранжирования
+        ranked = sorted(cnt.items(), key=lambda kv: kv[1] + _RF_BOOST.get(kv[0], 0), reverse=True)
+        return {"apps": [{"name": n, "count": c} for n, c in ranked[:limit]]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"top-apps failed: {e}")

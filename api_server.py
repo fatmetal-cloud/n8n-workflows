@@ -161,6 +161,8 @@ async def startup_event():
         print("✅ Facade table ready (workflow_ru)")
         fatmetal_deploy.init_deploy_table()
         print("✅ Deploy table ready (pending_deploys)")
+        fatmetal_facade.init_cat_table()
+        print("✅ Category table ready (workflow_cat)")
     except Exception as e:
         print(f"⚠️  Facade table init failed: {e}")
 
@@ -181,6 +183,7 @@ class WorkflowSummary(BaseModel):
     updated_at: Optional[str] = None
     ru_title: Optional[str] = None
     ru_description: Optional[str] = None
+    category: Optional[str] = None
 
     class Config:
         # Allow conversion of int to bool for active field
@@ -256,6 +259,8 @@ async def search_workflows(
     q: str = Query("", description="Search query"),
     trigger: str = Query("all", description="Filter by trigger type"),
     complexity: str = Query("all", description="Filter by complexity"),
+    integration: str = Query("all", description="Filter by integration/app name"),
+    category: str = Query("all", description="Filter by Fatmetal category"),
     active_only: bool = Query(False, description="Show only active workflows"),
     page: int = Query(1, ge=1, description="Page number"),
     per_page: int = Query(20, ge=1, le=100, description="Items per page"),
@@ -268,6 +273,8 @@ async def search_workflows(
             query=q,
             trigger_filter=trigger,
             complexity_filter=complexity,
+            integration_filter=integration,
+            category_filter=category,
             active_only=active_only,
             limit=per_page,
             offset=offset,
@@ -293,6 +300,7 @@ async def search_workflows(
                     "updated_at": workflow.get("updated_at"),
                 }
                 clean_workflow = fatmetal_facade.enrich_one(clean_workflow)
+                clean_workflow = fatmetal_facade.enrich_cat_many([clean_workflow])[0]
                 workflow_summaries.append(WorkflowSummary(**clean_workflow))
             except Exception as e:
                 print(
