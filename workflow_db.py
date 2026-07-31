@@ -541,6 +541,8 @@ class WorkflowDatabase:
         query: str = "",
         trigger_filter: str = "all",
         complexity_filter: str = "all",
+        integration_filter: str = "all",
+        category_filter: str = "all",
         active_only: bool = False,
         limit: int = 50,
         offset: int = 0,
@@ -563,6 +565,18 @@ class WorkflowDatabase:
         if complexity_filter != "all":
             where_conditions.append("w.complexity = ?")
             params.append(complexity_filter)
+
+        # Fatmetal: фильтр по интеграции (integrations - JSON-массив, ищем по имени).
+        if integration_filter != "all":
+            where_conditions.append("w.integrations LIKE ?")
+            params.append(f'%"{integration_filter}"%')
+
+        # Fatmetal: фильтр по категории (наша таблица workflow_cat, JOIN по filename).
+        if category_filter != "all":
+            where_conditions.append(
+                "w.filename IN (SELECT filename FROM workflow_cat WHERE category = ?)"
+            )
+            params.append(category_filter)
 
         # Use FTS search if query provided
         if query.strip():
