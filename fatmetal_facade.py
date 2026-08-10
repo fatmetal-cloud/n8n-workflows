@@ -458,6 +458,48 @@ async def cat_pending(limit: int = 50):
         raise HTTPException(status_code=500, detail=f"cat pending failed: {e}")
 
 
+# ── Canonical для дублей (workflow_canonical) ────────────────────────────────
+# У части сценариев есть дубли (одинаковый контент под разными filename). НЕ удаляем
+# (иначе 404 + потеря SEO-веса), а помечаем: дубль -> основная. Фронт ставит
+# <link rel="canonical"> на основную. Отдельная таблица - reindex её не затрёт.
+def init_canon_table() -> None:
+    with _conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS workflow_canonical (
+                filename           TEXT PRIMARY KEY,
+                canonical_filename TEXT NOT NULL,
+                created_at         TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+def enrich_canon_many(items):
+    """Добавить canonical_filename по filename. Для не-дублей = None (фронт канонит на себя)."""
+    filenames = [i.get("filename") for i in items if i.get("filename")]
+    canon_map = {}
+    if filenames:
+        try:
+            ph = ",".join("?" * len(filenames))
+            with _conn() as c:
+                rows = c.execute(
+                    f"SELECT filename, canonical_filename FROM workflow_canonical WHERE filename IN ({ph})",
+                    filenames,
+                ).fetchall()
+            canon_map = {r["filename"]: r["canonical_filename"] for r in rows}
+        except Exception:
+            pass
+    for i in items:
+        i["canonical_filename"] = canon_map.get(i.get("filename"))
+    return items
+
+def upsert_canonical(filename: str, canonical_filename: str) -> None:
+    with _conn() as c:
+        c.execute("""
+            INSERT INTO workflow_canonical (filename, canonical_filename, created_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(filename) DO UPDATE SET canonical_filename=excluded.canonical_filename
+        """, (filename, canonical_filename))
+
+
 # Топ приложений с РФ-приоритетом. Служебные ноды не считаем.
 _APP_JUNK = {
     "Webhook","Httprequest","Respondtowebhook","Splitinbatches","Executeworkflow",
