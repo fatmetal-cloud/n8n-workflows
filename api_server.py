@@ -163,6 +163,7 @@ async def startup_event():
         print("✅ Deploy table ready (pending_deploys)")
         fatmetal_facade.init_cat_table()
         fatmetal_facade.init_canon_table()
+        fatmetal_facade.init_health_table()
         print("✅ Category table ready (workflow_cat)")
     except Exception as e:
         print(f"⚠️  Facade table init failed: {e}")
@@ -186,6 +187,7 @@ class WorkflowSummary(BaseModel):
     ru_description: Optional[str] = None
     category: Optional[str] = None
     canonical_filename: Optional[str] = None
+    error_count: Optional[int] = None
 
     class Config:
         # Allow conversion of int to bool for active field
@@ -304,6 +306,7 @@ async def search_workflows(
                 clean_workflow = fatmetal_facade.enrich_one(clean_workflow)
                 clean_workflow = fatmetal_facade.enrich_cat_many([clean_workflow])[0]
                 clean_workflow = fatmetal_facade.enrich_canon_many([clean_workflow])[0]
+                clean_workflow = fatmetal_facade.enrich_health_many([clean_workflow])[0]
                 workflow_summaries.append(WorkflowSummary(**clean_workflow))
             except Exception as e:
                 print(
@@ -391,6 +394,7 @@ async def get_workflow_detail(filename: str, request: Request):
         _meta = fatmetal_facade.enrich_one(dict(workflow_meta))
         _meta = fatmetal_facade.enrich_cat_many([_meta])[0]
         _meta = fatmetal_facade.enrich_canon_many([_meta])[0]
+        _meta = fatmetal_facade.enrich_health_many([_meta])[0]
         return {"metadata": _meta, "raw_json": raw_json}
     except HTTPException:
         raise
