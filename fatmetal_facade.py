@@ -1009,6 +1009,43 @@ _NODE_MAX_VERSION = {
 }
 
 
+# --- Health сценария (workflow_health): число ошибок валидации ПОСЛЕ санации ---
+# Меряно валидатором n8n-as-code по санированному /download. error_count = число
+# структурных ошибок (кроме версий - их чинит санация). 0 = чистый (витрина),
+# >=11 = безнадёжный (фронт ставит noindex). Отдельная таблица - переживает reindex.
+def init_health_table() -> None:
+    with _conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS workflow_health (
+                filename    TEXT PRIMARY KEY,
+                error_count INTEGER NOT NULL,
+                measured_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+def enrich_health_many(items):
+    filenames=[i.get("filename") for i in items if i.get("filename")]
+    hmap={}
+    if filenames:
+        try:
+            ph=",".join("?"*len(filenames))
+            with _conn() as c:
+                rows=c.execute(f"SELECT filename, error_count FROM workflow_health WHERE filename IN ({ph})", filenames).fetchall()
+            hmap={r["filename"]: r["error_count"] for r in rows}
+        except Exception:
+            pass
+    for i in items:
+        i["error_count"]=hmap.get(i.get("filename"))
+    return items
+
+def upsert_health(filename: str, error_count: int) -> None:
+    with _conn() as c:
+        c.execute("""INSERT INTO workflow_health (filename, error_count, measured_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(filename) DO UPDATE SET error_count=excluded.error_count, measured_at=datetime('now')""",
+            (filename, error_count))
+
+
 # --- Санация workflow JSON: убрать связи на несуществующие ноды ---
 # Часть сценариев апстрима ссылается в connections на error-handler-ноды,
 # которых нет в nodes. n8n >= 2.29 строго валидирует это и отклоняет импорт.
